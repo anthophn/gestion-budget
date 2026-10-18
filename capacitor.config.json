@@ -1,0 +1,15 @@
+{
+  "appId": "app.kakeibo.budget",
+  "appName": "Kakeibo",
+  "webDir": "dist",
+  "backgroundColor": "#f6f3ec",
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "native",
+      "initialViewportFitValueHint": "cover"
+    }
+  }
+}

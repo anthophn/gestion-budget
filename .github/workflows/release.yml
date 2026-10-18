@@ -1,0 +1,191 @@
+# Fabrique les applications à télécharger et les publie dans la page « Releases » du dépôt :
+#   Windows (.exe) · macOS (.dmg) · Linux (.AppImage) · Android (.apk)
+# Lancement : onglet Actions > « Publier les applications » > Run workflow > indiquer la version (ex. 1.0.0).
+# (Ou en poussant une étiquette git v1.0.0.)
+name: Publier les applications
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Numéro de version (format 1.0.0)'
+        required: true
+        default: '1.0.0'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      public_url: ${{ steps.v.outputs.public_url }}
+    steps:
+      - id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          V="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          V="${V#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version invalide « $V » : utilise le format 1.0.0"
+            exit 1
+          fi
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          REPO="${GITHUB_REPOSITORY#*/}"
+          if [[ "$REPO" == *.github.io ]]; then DEFAULT_URL="https://$OWNER.github.io/"; else DEFAULT_URL="https://$OWNER.github.io/$REPO/"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "public_url=${PUBLIC_URL:-$DEFAULT_URL}" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+
+      - name: Construire l'appli
+        shell: bash
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_PUBLIC_URL: ${{ needs.prepare.outputs.public_url }}
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          npm ci
+          npm run build:app
+          rm -rf desktop/web
+          cp -r dist desktop/web
+
+      - name: Fabriquer l'application de bureau
+        shell: bash
+        working-directory: desktop
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          npm ci
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npx electron-builder --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.dmg
+            desktop/release/*.AppImage
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Construire l'appli
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_PUBLIC_URL: ${{ needs.prepare.outputs.public_url }}
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          npm ci
+          npm run build:app
+
+      - name: Préparer le projet Android
+        run: |
+          npx cap add android
+          node scripts/android-setup.mjs "${{ needs.prepare.outputs.version }}" "${{ github.run_number }}"
+          npx cap sync android
+
+      - name: Fabriquer l'APK
+        shell: bash
+        working-directory: android
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          # Facultatif : une clé de signature permanente (voir le tuto, section « avancé »).
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          chmod +x gradlew
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            ./gradlew assembleRelease --no-daemon \
+              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+              -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$KEYSTORE_PASSWORD"
+            cp app/build/outputs/apk/release/app-release.apk "../Kakeibo-$VERSION-android.apk"
+          else
+            ./gradlew assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/app-debug.apk "../Kakeibo-$VERSION-android.apk"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          if-no-files-found: error
+          path: Kakeibo-*-android.apk
+
+  release:
+    needs: [prepare, desktop, android]
+    if: ${{ always() && needs.prepare.result == 'success' && (needs.desktop.result == 'success' || needs.android.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Kakeibo ${{ needs.prepare.outputs.version }}
+          make_latest: true
+          files: files/*
+          body: |
+            ## Télécharger Kakeibo
+
+            **Le plus simple, sur tous les appareils (iPhone compris) :** ouvre ${{ needs.prepare.outputs.public_url }} puis « Installer » / « Ajouter à l'écran d'accueil ».
+
+            | Appareil | Fichier à télécharger ci-dessous |
+            | --- | --- |
+            | Windows 10 / 11 | `Kakeibo-${{ needs.prepare.outputs.version }}-win-x64.exe` |
+            | Mac (puce Apple M1, M2…) | `Kakeibo-${{ needs.prepare.outputs.version }}-mac-arm64.dmg` |
+            | Mac (Intel) | `Kakeibo-${{ needs.prepare.outputs.version }}-mac-x64.dmg` |
+            | Linux | `Kakeibo-${{ needs.prepare.outputs.version }}-linux-x86_64.AppImage` |
+            | Android | `Kakeibo-${{ needs.prepare.outputs.version }}-android.apk` |
+
+            Les applications ne sont pas signées par un éditeur payant : Windows et macOS afficheront un avertissement au premier lancement (« Informations complémentaires > Exécuter quand même » sur Windows, « Réglages > Confidentialité et sécurité > Ouvrir quand même » sur Mac). Sur Android, autorise l'installation d'applications inconnues.
+
+            Tes données sont stockées en ligne : connecte-toi avec le même compte sur chaque appareil pour tout retrouver.

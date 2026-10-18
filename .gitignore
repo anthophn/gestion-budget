@@ -1,0 +1,9 @@
+node_modules
+/dist
+/android
+desktop/web
+desktop/release
+.env
+.env.local
+*.log
+.DS_Store

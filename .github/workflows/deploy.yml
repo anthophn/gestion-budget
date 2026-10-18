@@ -1,0 +1,60 @@
+# Met l'appli web en ligne sur GitHub Pages à chaque modification de la branche « main ».
+# Prérequis (une seule fois) : Settings > Pages > Source : « GitHub Actions »,
+# et les secrets VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY dans Settings > Secrets and variables > Actions.
+name: Mettre le site en ligne
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Construire le site
+        shell: bash
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          if [ -z "$VITE_SUPABASE_URL" ] || [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "::warning::Secrets Supabase absents : le site fonctionnera en mode local (sans comptes partagés ni synchronisation). Voir le tuto, étape 2."
+          fi
+          # Un dépôt nommé « pseudo.github.io » est servi à la racine, les autres sous /nom-du-depot/
+          if [[ "$REPO_NAME" == *.github.io ]]; then export BASE_PATH=/; else export BASE_PATH="/$REPO_NAME/"; fi
+          npm run build
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
